@@ -5,7 +5,7 @@ import type { FirstText, FlowStamp, OpenerCaps, PromptStamp, ShipStamp, StepStam
 import { VERB_W, activityHead, changeParts, diffRows, diffTop, foldOf, foldRow, layoutStep, mcpName, relPath, stepOf, stepParts } from './activity'
 import type { Step } from './activity'
 import { browserBottom, browserTarget, browserTool, browserTop, browserUrl, browserVerb, openRunBefore, urlBar } from './browser'
-import { logStepEnd, logStepStart, logTurnEnd, logTurnStart, registerCockpit, startCockpit } from './cockpit'
+import { drawLive, logAsk, logMode, logSaid, logStepEnd, logStepStart, logTurnEnd, logTurnStart, registerCockpit, startCockpit } from './cockpit'
 import { C, G, Rule, clip, fmtClock, fmtDuration, fmtTokens, layout, pad, ruleWidth, vw } from './grid'
 import type { Lay, Ui } from './grid'
 import { splitBlocks } from './blocks'
@@ -1524,6 +1524,7 @@ export const register: Register = (on, options) => {
     try {
       if (e.agentId === undefined && e.door === 'response') {
         await noteFlow($, e.message.content)
+        await logSaid($, e.message.content)
       }
 
       if (e.agentId === undefined && (e.door === 'prompt' || e.door === 'command')) {
@@ -1648,6 +1649,7 @@ export const register: Register = (on, options) => {
 
       if (e.agentId === undefined && id !== undefined && e.approver === 'person' && verdict.decision === 'ask') {
         await update($, asked, list => [...list.filter(x => x !== id), id].slice(-100))
+        await logAsk($, id)
       }
     } catch {
       // A note that fails costs the row its `needs you`, nothing more.
@@ -1938,7 +1940,7 @@ export const register: Register = (on, options) => {
         await update($, awaitingFirst, () => false)
 
         try {
-          await logTurnEnd($, e.durationMs)
+          await logTurnEnd($, e.durationMs, e.isAborted)
         } catch {
           // A step left running reads `running` until the next turn starts.
         }
@@ -2010,7 +2012,14 @@ export const register: Register = (on, options) => {
 
   // The spinner (§5.11): props only. The verb says what the turn does; the engine keeps
   // its own time, tokens and `esc` hint. A state's own message stands.
-  on('ui.render', { component: 'Spinner' }, (_$, e, next) => {
+  on('ui.render', { component: 'Spinner' }, async ($, e, next) => {
+    // Docked Cockpit: the live area is one `working` row (E.33).
+    const live = e.surface === 'terminal' ? await drawLive($, e) : undefined
+
+    if (live !== undefined) {
+      return live
+    }
+
     const word = spinnerWord(e.props.mode)
 
     if (e.surface !== 'terminal' || e.props.message !== null || word === undefined) {
@@ -2031,8 +2040,15 @@ export const register: Register = (on, options) => {
 
     let since: number | undefined
 
+    try {
+      await logMode($, 'request')
+    } catch {
+      // The head says `waiting` a little late, nothing more.
+    }
+
     for await (const chunk of stream) {
       try {
+        await logMode($, chunk.kind)
         if (chunk.kind === 'thinking' && since === undefined) {
           since = await $.clock.now()
         } else if (since !== undefined && chunk.kind !== 'thinking' && chunk.kind !== 'engine') {

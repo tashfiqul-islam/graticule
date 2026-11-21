@@ -1,6 +1,6 @@
 // Cockpit's step log: one turn's tool calls as `[ STEPS ]` rows (spec E.12, E.37, E.39, H.5; amendments 1
 // and 2). Pure: hooks/cockpit.tsx keeps the log in $.state and draws what `stepRows` returns.
-import type { StepLog, LogStep, StepMark } from '../types'
+import type { LastTurn, StepLog, LogStep, StepMark } from '../types'
 import { DENIED, describe, firstErrorLine, mcpName, relPath, resultOf, TEST_CMD } from './activity'
 import { cellWidth, vw } from './grid'
 import { isShipCommand, parseShip, runnerOf, shellText } from './outcome'
@@ -31,7 +31,39 @@ const INTERRUPTED = /\binterrupted\b/i
 
 /** An empty log for a turn that started at `startedAt`; unknown (null), the turn's first step starts its clock. */
 export function newLog(turn: string | null, startedAt: number | null): StepLog {
-  return { turn, startedAt, steps: [], dropped: 0 }
+  return { turn, startedAt, steps: [], dropped: 0, turnNo: 0, isTurnRunning: false, said: '', mode: null, modeSince: null, asking: [], last: null, prev: null }
+}
+
+/**
+ * A main-loop turn starts: the next number, an empty log, and the last turn that had steps kept for
+ * `[ STEPS · TURN n ]` until this one has its own.
+ */
+export function newTurn(log: StepLog, turn: string, startedAt: number | null): StepLog {
+  const prev = log.steps.length > 0 ? { turnNo: log.turnNo, steps: log.steps, dropped: log.dropped } : log.prev
+
+  return { ...newLog(turn, startedAt), turnNo: log.turnNo + 1, isTurnRunning: true, prev }
+}
+
+/** Claude said something in this turn: its first sentence is `[ NOW ]`'s row 1. */
+export function noteSaid(log: StepLog, text: string): StepLog {
+  const line =
+    text
+      .split('\n')
+      .find(l => l.trim().length > 0)
+      ?.trim() ?? ''
+  const sentence = /^.*?[.!?](?=\s|$)/.exec(line)?.[0] ?? line
+
+  return sentence.length === 0 ? log : { ...log, said: sentence }
+}
+
+/** The spinner's mode changed (`thinking`, `requesting`, …): kept with when it began, for `[ NOW ]`'s row 2. */
+export function noteMode(log: StepLog, mode: string, at: number): StepLog {
+  return log.mode === mode ? log : { ...log, mode, modeSince: at }
+}
+
+/** A step waits on the person's permission answer. */
+export function askStep(log: StepLog, id: string): StepLog {
+  return log.asking.includes(id) ? log : { ...log, asking: [...log.asking, id] }
 }
 
 const two = (n: number) => String(n).padStart(2, '0')
@@ -148,6 +180,66 @@ function fixKey(kind: string, subject: string, input: unknown): string {
   return kind === 'test' ? `test:${runnerOf(command(input)) ?? subject}` : `${kind}:${subject}`
 }
 
+const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`
+
+// A check that passes by printing nothing (formatters, linters, type checkers): its silence reads `clean`.
+const CHECK_CMD =
+  /(?:^|[\s/])(?:oxlint|eslint|biome|prettier|oxfmt|ruff|black|gofmt|rustfmt|clippy|tsc|mypy|shellcheck|actionlint|zizmor|lint|fmt|format|typecheck)\b/
+// `git` and its global options (`-C dir`, `-c k=v`, `--no-pager`) before the subcommand.
+const gitSub = (sub: string) => new RegExp(String.raw`^git(?:\s+-[Cc]\s+\S+|\s+--[\w-]+(?:=\S+)?)*\s+${sub}\b`)
+const GIT_STATUS = gitSub('status')
+const GIT_DIFF = gitSub('diff')
+
+/** `git status`, long or short: `clean`, `N changed`, `N untracked`, or both. */
+function gitStatus(text: string): string {
+  const lines = text.split('\n')
+  const short = lines.filter(l => /^[ MADRCU?!]{2} \S/.test(l))
+  let changed = short.filter(l => !l.startsWith('??')).length
+  let untracked = short.length - changed
+
+  if (short.length === 0) {
+    const at = lines.findIndex(l => l.startsWith('Untracked files:'))
+    const listed = (from: number, to: number) => lines.slice(from, to).filter(l => l.startsWith('\t')).length
+
+    changed = listed(0, at < 0 ? lines.length : at)
+    untracked = at < 0 ? 0 : listed(at, lines.length)
+  }
+
+  // Both at once must fit the 16-cell result: untracked files are new files.
+  if (changed > 0 && untracked > 0) return `${changed} changed +${untracked} new`
+  if (changed > 0) return `${changed} changed`
+
+  return untracked > 0 ? `${untracked} untracked` : 'clean'
+}
+
+/** `git diff`: `+a −d` from a `--stat` summary or the patch; `no changes` when empty. */
+function gitDiff(text: string): string {
+  const added = /(\d+) insertions?\(\+\)/.exec(text)?.[1]
+  const removed = /(\d+) deletions?\(-\)/.exec(text)?.[1]
+  const isStat = added !== undefined || removed !== undefined
+  const lines = text.split('\n')
+  const adds = isStat ? Number(added ?? 0) : lines.filter(l => l.startsWith('+') && !l.startsWith('+++')).length
+  const dels = isStat ? Number(removed ?? 0) : lines.filter(l => l.startsWith('-') && !l.startsWith('---')).length
+
+  return adds + dels === 0 ? 'no changes' : [...(adds > 0 ? [`+${adds}`] : []), ...(dels > 0 ? [`−${dels}`] : [])].join(' ')
+}
+
+/** `ls`: `N items` (not `total n`, `.` or `..`), or `empty`. */
+function listing(text: string): string {
+  const items = text.split('\n').filter(l => l.trim().length > 0 && !/^total \d+$/.test(l.trim()) && !/(?:^|\s)\.\.?$/.test(l.trim()))
+
+  return items.length === 0 ? 'empty' : plural(items.length, 'item')
+}
+
+/** A passing shell step's result: a short summary for common commands, else its last line of output. */
+function shellSummary(cmd: string, text: string): string {
+  if (GIT_STATUS.test(cmd)) return gitStatus(text)
+  if (GIT_DIFF.test(cmd)) return gitDiff(text)
+  if (/^ls\b/.test(cmd)) return listing(text)
+
+  return lastLine(text) || (CHECK_CMD.test(cmd) ? 'clean' : 'no output')
+}
+
 const tonesText = (tones: readonly { text: string }[] | undefined) => tones?.map(t => t.text).join(' ') ?? ''
 
 /** An error's result and mark. */
@@ -197,7 +289,7 @@ function outcomeOf(kind: string, tool: string, input: unknown, outcome: Outcome,
     if (ship?.push !== undefined) return { result: ship.push.to, mark: '↗' }
     if (ship?.commit !== undefined) return { result: ship.commit.sha, mark: '±' }
 
-    return { result: lastLine(shellText(out)) || 'clean', mark: fixes ? '✓' : '' }
+    return { result: shellSummary(cmd, shellText(out)), mark: fixes ? '✓' : '' }
   }
 
   switch (tool) {
@@ -315,22 +407,55 @@ export function settleStep(log: StepLog, end: StepEnd): StepLog {
 
   const fixes = log.steps.some((s, i) => i < at && s.key === row.key && isOpen(log.steps, i))
   const { result, mark } = outcomeOf(row.kind, end.tool, end.input, end.outcome, fixes)
+  const asking = log.asking.filter(id => id !== end.id)
 
-  return { ...log, steps: log.steps.with(at, { ...row, result, mark, isRunning: false, clock }) }
+  // The step is answered; the model is called again: `[ NOW ]` says `waiting` from here.
+  return { ...log, asking, mode: 'requesting', modeSince: end.at, steps: log.steps.with(at, { ...row, result, mark, isRunning: false, clock }) }
+}
+
+/** `[ LAST ]`'s verdict: the state word, the story in a few words, and what waits. */
+function verdict(steps: readonly LogStep[], isAborted: boolean): Pick<LastTurn, 'state' | 'story' | 'wait'> {
+  if (isAborted) {
+    const cutAt = steps.findLast(s => s.result === 'interrupted')
+
+    return { state: 'interrupted', story: cutAt === undefined ? plural(steps.length, 'step') : `cut at ${cutAt.kind} ${cutAt.subject}`, wait: '' }
+  }
+
+  if (steps.length === 0) return { state: 'done', story: 'no steps', wait: '' }
+
+  const failures = steps.filter(s => s.mark === '✕')
+  const open = failures.filter(s => isOpen(steps, steps.indexOf(s)))
+  const first = open[0]
+
+  if (first !== undefined) {
+    return { state: 'failed', story: `${plural(open.length, 'failure')} · ${first.kind} ${first.subject}`, wait: 'ask Claude to continue' }
+  }
+
+  const shipped = steps.findLast(s => s.mark === '↗')
+  const committed = steps.findLast(s => s.mark === '±')
+  const facts = [
+    ...(failures.length > 0 ? [`${plural(failures.length, 'failure')} → fixed`] : []),
+    ...(committed === undefined ? [] : [`± ${committed.result}`]),
+    ...(shipped === undefined ? [] : [`↗ ${shipped.result}`])
+  ]
+
+  return { state: 'done', story: facts.length > 0 ? facts.join(' · ') : plural(steps.length, 'step'), wait: '' }
 }
 
 /**
- * The turn ended after `durationMs`: a step still running was cut (an interrupted turn has no receipt; correction G).
- * Its clock is the turn's end, or where it started when the turn's start is unknown.
+ * The turn ended after `durationMs`: a step still running was cut (an interrupted turn has no receipt; correction G),
+ * its clock the turn's end, or where it started when the turn's start is unknown. The head turns to `[ LAST ]`.
  */
-export function endTurn(log: StepLog, durationMs: number): StepLog {
+export function endTurn(log: StepLog, durationMs: number, isAborted = false): StepLog {
   const turnEnd = log.startedAt === null ? undefined : durationMs
+  const steps = log.steps.map(s => (s.isRunning ? { ...s, isRunning: false, result: 'interrupted', mark: '' as const, clock: turnEnd ?? s.clock } : s))
+  const last: LastTurn = { ...verdict(steps, isAborted), durationMs, endedAt: log.startedAt === null ? null : log.startedAt + durationMs }
 
-  return { ...log, steps: log.steps.map(s => (s.isRunning ? { ...s, isRunning: false, result: 'interrupted', mark: '', clock: turnEnd ?? s.clock } : s)) }
+  return { ...log, steps, isTurnRunning: false, asking: [], mode: null, modeSince: null, last }
 }
 
 /** A hard cut to `n` cells, ending in `…`; spec mocks cut mid-word (`bun te…`). */
-function cut(s: string, n: number): string {
+export function cut(s: string, n: number): string {
   if (n <= 0) return ''
   if (vw(s) <= n) return s
 
@@ -392,23 +517,31 @@ function earlierRow(hidden: readonly LogStep[], dropped: number, width: number):
   return [{ t: t + spaces(width - vw(t)), color: C.dim }]
 }
 
-/** `┄ [ STEPS ] ┄…┄ 12 steps · 2 failed`, exactly `width` cells. */
-function labelRow(log: StepLog, width: number): Part[] {
-  const total = log.steps.length + log.dropped
-  const failed = log.steps.filter(s => s.mark === '✕').length
-  const count = `${total} ${total === 1 ? 'step' : 'steps'}`
-  const fail = failed > 0 ? ` · ${failed} failed` : ''
-  const fill = width - vw('┄ [ STEPS ] ') - 1 - vw(count) - vw(fail)
+/**
+ * A section's label rule, `┄ [ TITLE ] ┄…┄ meta`, exactly `width` cells: the title muted (or in `color`), the
+ * meta parts at the right edge.
+ */
+export function sectionLabel(title: string, meta: readonly Part[], width: number, color: string = C.muted): Part[] {
+  const used = vw(`┄ [ ${title} ] `) + 1 + meta.reduce((n, p) => n + vw(p.t), 0)
 
   return [
     { t: '┄ ', color: C.hairline },
     { t: '[ ', color: C.dim },
-    { t: 'STEPS', color: C.muted },
+    { t: title, color },
     { t: ' ] ', color: C.dim },
-    { t: '┄'.repeat(Math.max(1, fill)), color: C.hairline },
-    { t: ` ${count}`, color: C.muted },
-    ...(fail.length > 0 ? [{ t: fail, color: C.err }] : [])
+    { t: '┄'.repeat(Math.max(1, width - used)), color: C.hairline },
+    { t: ' ', color: C.muted },
+    ...meta
   ]
+}
+
+/** `┄ [ STEPS ] ┄…┄ 12 steps · 2 failed`, exactly `width` cells. */
+function labelRow(log: StepLog, width: number, title: string): Part[] {
+  const total = log.steps.length + log.dropped
+  const failed = log.steps.filter(s => s.mark === '✕').length
+  const fail = failed > 0 ? [{ t: ` · ${failed} failed`, color: C.err }] : []
+
+  return sectionLabel(title, [{ t: plural(total, 'step'), color: C.muted }, ...fail], width)
 }
 
 const OPEN_MAX = 3
@@ -419,14 +552,15 @@ const OPEN_MAX = 3
  * @param log the turn's log
  * @param width the pane's body columns
  * @param rows the pane's body rows
+ * @param title the label: `STEPS`, or `STEPS · TURN n` for an earlier turn's steps
  * @returns one Part list per row, none when the turn has no steps
  */
-export function stepRows(log: StepLog, width: number, rows: number): Part[][] {
+export function stepRows(log: StepLog, width: number, rows: number, title = 'STEPS'): Part[][] {
   const steps = log.steps
 
   if (steps.length === 0 || rows < 1) return []
 
-  const label = labelRow(log, width)
+  const label = labelRow(log, width, title)
   const room = rows - 1
 
   if (steps.length <= room && log.dropped === 0) return [label, ...steps.map(s => stepRow(s, width))]

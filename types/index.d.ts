@@ -72,8 +72,31 @@ export type LogStep = {
   failed?: number
 }
 
-/** Cockpit's step log for the current (or last) main-loop turn; `dropped` counts the oldest steps past the cap. */
-export type StepLog = { turn: string | null; startedAt: number | null; steps: LogStep[]; dropped: number }
+/** How a finished turn ended, for `[ LAST ]`: its state word, the story in a few words, what waits (or ''), its time, and when it ended (wall clock, ms). */
+export type LastTurn = { state: 'done' | 'failed' | 'interrupted'; story: string; wait: string; durationMs: number; endedAt: number | null }
+
+/** The steps of the most recent earlier turn that had any, shown while a turn has none (`[ STEPS · TURN n ]`). */
+export type PrevSteps = { turnNo: number; steps: LogStep[]; dropped: number }
+
+/**
+ * Cockpit's log for the current (or last) main-loop turn. `dropped` counts the oldest steps past the cap.
+ * The head reads the rest: the turn's number, whether it runs, the last thing Claude said, the spinner's mode
+ * and since when (wall clock, ms), the steps waiting on a permission answer, and how the turn ended.
+ */
+export type StepLog = {
+  turn: string | null
+  startedAt: number | null
+  steps: LogStep[]
+  dropped: number
+  turnNo: number
+  isTurnRunning: boolean
+  said: string
+  mode: string | null
+  modeSince: number | null
+  asking: string[]
+  last: LastTurn | null
+  prev: PrevSteps | null
+}
 
 declare module 'claude-code' {
   interface PluginState {
@@ -93,6 +116,8 @@ declare module 'claude-code' {
       flow: Shaped<FlowStamp[]>
       testRuns: Shaped<TestRunStamp[]>
       ships: Shaped<ShipStamp[]>
+      second: Shaped<number>
+      frame: Shaped<number>
       stepLog: Shaped<StepLog>
     }
   }
